@@ -1,0 +1,18 @@
+services:
+  whatsapp-mcp:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      HTTP_ADDR: ":8080"
+      PUBLIC_BASE_URL: "http://localhost:8080" # change to your public domain behind a reverse proxy
+      WHATSAPP_DB_PATH: "data/whatsapp.db"
+      HISTORY_DB_PATH: "data/history.db"
+      LOG_LEVEL: "INFO"
+      MCP_AUTH_TOKEN: ""
+    volumes:
+      - wa-data:/app/data
+
+volumes:
+  wa-data:
