@@ -13,6 +13,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
+	waStore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -28,6 +29,8 @@ type Client struct {
 	history *store.HistoryStore
 	log     waLog.Logger
 
+	onIncomingMessage func(m store.Message, isGroup bool)
+
 	mu         sync.RWMutex
 	lastQRCode string
 	paired     atomic.Bool
@@ -37,9 +40,25 @@ type Client struct {
 // persists its own session/device (encryption keys, etc) -- keep this safe,
 // losing it means re-scanning the QR code and whatsmeow forgetting the
 // session. onQR is called every time a fresh QR code is issued during
-// pairing (nil after pairing succeeds).
-func New(ctx context.Context, dbPath string, history *store.HistoryStore, logLevel string, onQR func(code string)) (*Client, error) {
+// pairing (nil after pairing succeeds). onIncomingMessage, if non-nil, is
+// called for every message received from someone else (not our own
+// outbound messages) after it's been persisted to history -- e.g. to
+// dispatch a webhook. It may be nil.
+func New(ctx context.Context, dbPath string, history *store.HistoryStore, logLevel string, onQR func(code string), onIncomingMessage func(m store.Message, isGroup bool)) (*Client, error) {
 	dbLog := waLog.Stdout("Database", logLevel, true)
+
+	// WhatsApp periodically raises the minimum accepted client version;
+	// whatsmeow ships a hardcoded default that goes stale between releases,
+	// which shows up as "Client outdated (405) connect failure". Fetching
+	// the current version at startup keeps this from happening even if the
+	// whatsmeow dependency itself isn't the very latest.
+	if latestVer, vErr := whatsmeow.GetLatestVersion(ctx, nil); vErr != nil {
+		dbLog.Warnf("could not fetch latest WhatsApp web version, falling back to whatsmeow's built-in default: %v", vErr)
+	} else {
+		waStore.SetWAVersion(*latestVer)
+		dbLog.Infof("using WhatsApp web client version %s", latestVer.String())
+	}
+
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+dbPath+"?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000", dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("open whatsmeow session store: %w", err)
@@ -53,7 +72,7 @@ func New(ctx context.Context, dbPath string, history *store.HistoryStore, logLev
 	clientLog := waLog.Stdout("Client", logLevel, true)
 	waClient := whatsmeow.NewClient(device, clientLog)
 
-	c := &Client{wa: waClient, history: history, log: clientLog}
+	c := &Client{wa: waClient, history: history, log: clientLog, onIncomingMessage: onIncomingMessage}
 	waClient.AddEventHandler(c.handleEvent)
 
 	if waClient.Store.ID == nil {
@@ -245,7 +264,7 @@ func (c *Client) onMessage(ctx context.Context, evt *events.Message) {
 		LastMessageTime: evt.Info.Timestamp,
 		LastMessageText: preview,
 	})
-	_ = c.history.SaveMessage(ctx, store.Message{
+	msg := store.Message{
 		ID:         evt.Info.ID,
 		ChatJID:    chatJID,
 		SenderJID:  evt.Info.Sender.String(),
@@ -255,7 +274,12 @@ func (c *Client) onMessage(ctx context.Context, evt *events.Message) {
 		FromMe:     evt.Info.IsFromMe,
 		MediaType:  mediaType,
 		Caption:    caption,
-	})
+	}
+	_ = c.history.SaveMessage(ctx, msg)
+
+	if !evt.Info.IsFromMe && c.onIncomingMessage != nil {
+		c.onIncomingMessage(msg, evt.Info.IsGroup)
+	}
 }
 
 // onHistorySync backfills chat history that WhatsApp pushes shortly after

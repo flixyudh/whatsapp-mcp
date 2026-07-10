@@ -63,12 +63,26 @@ automatically; you won't need to re-scan unless you delete
 
 ## Running with Docker
 
+`compose.yaml` runs both this server and an n8n instance on the same Docker
+network, so n8n can reach it by service name without any port juggling.
+
 ```bash
+cp .env.example .env
+# edit .env — at minimum set N8N_ENCRYPTION_KEY (see comment in the file)
 docker compose up --build
 ```
 
-Same pairing flow — check `docker compose logs -f` for the QR code, or visit
-`/qr`. The session and history databases persist in the `wa-data` volume.
+Same pairing flow — check `docker compose logs -f whatsapp-mcp` for the QR
+code, or visit `http://localhost:8080/qr`. The session and history databases
+persist in the `wa-data` volume; n8n's data persists in `n8n-data`.
+
+n8n is reachable at `http://localhost:5678`. From inside n8n, connect to this
+server using the **service name**, not `localhost` (that would point at the
+n8n container itself): `http://whatsapp-mcp:8080/mcp`. See "Using this from
+n8n" below for exact node configuration.
+
+Only running this server without n8n? `docker compose up --build whatsapp-mcp`
+starts just that service.
 
 For a real deployment, put this behind a reverse proxy that terminates TLS
 and forwards to port 8080, and set `PUBLIC_BASE_URL` to your real HTTPS
@@ -79,15 +93,86 @@ whoever can reach `/sse` can send messages as your WhatsApp account.
 
 ## Connecting an MCP client
 
-Point your MCP client at `http://<host>:8080/sse` (SSE transport). If you set
-`MCP_AUTH_TOKEN`, configure the client to send
-`Authorization: Bearer <token>` on requests.
+Two transports are exposed, same tools on both:
+
+- **Streamable HTTP** (recommended): `http://<host>:8080/mcp`
+- **SSE** (kept for older clients): `http://<host>:8080/sse`
+
+If you set `MCP_AUTH_TOKEN`, configure the client to send
+`Authorization: Bearer <token>` on requests, on either transport.
+
+## Listening for incoming messages from a specific number
+
+The server can push a webhook for incoming messages instead of (or in
+addition to) MCP clients pulling history on demand. This is what lets an
+n8n **Webhook** trigger node kick off a workflow the moment a specific
+number messages you.
+
+Set in `.env` (or the container's environment):
+
+```bash
+WEBHOOK_URL=http://n8n:5678/webhook/wa-incoming   # your n8n Webhook node's URL
+WEBHOOK_FROM_NUMBERS=6281234567890                # comma-separated; empty = every incoming message
+WEBHOOK_SECRET=some-random-string                 # optional, signs the payload
+```
+
+(Inside the bundled `compose.yaml`, reach n8n by service name — `n8n:5678` —
+same reasoning as reaching whatsapp-mcp via `whatsapp-mcp:8080` from n8n's
+side.)
+
+For every matching incoming message (never your own outbound ones), a POST
+like this is sent:
+
+```json
+{
+  "id": "3EB0...",
+  "chat_jid": "6281234567890@s.whatsapp.net",
+  "sender_jid": "6281234567890@s.whatsapp.net",
+  "sender_name": "Yudi",
+  "timestamp": "2026-07-10T09:15:00+07:00",
+  "text": "are we still on for tomorrow?",
+  "media_type": "",
+  "caption": "",
+  "is_group": false
+}
+```
+
+If `WEBHOOK_SECRET` is set, the request also carries an
+`X-Webhook-Signature: sha256=<hex hmac>` header (HMAC-SHA256 of the raw
+body) — same convention GitHub/Stripe use, easy to verify from an n8n
+**Code** node:
+
+```javascript
+const crypto = require('crypto');
+const expected = 'sha256=' + crypto
+  .createHmac('sha256', 'some-random-string')
+  .update($input.first().json.rawBody) // requires Webhook node's "Raw Body" option enabled
+  .digest('hex');
+if (expected !== $input.first().headers['x-webhook-signature']) {
+  throw new Error('signature mismatch');
+}
+```
+
+Delivery is fire-and-forget with a 10s timeout — a slow or unreachable n8n
+instance never blocks WhatsApp message handling, and failed deliveries are
+just logged, not retried. Only one webhook target is supported at a time;
+if you need to notify several endpoints, put a fan-out step on the n8n side.
 
 ## Using this from n8n
 
 There are two ways to send a WhatsApp message from an n8n workflow, depending
 on whether the decision to send (and what to send) is made by a fixed
-workflow step or by an AI Agent:
+workflow step or by an AI Agent. In both cases below, the host to use
+depends on how n8n is deployed relative to this server:
+
+- **Both running via the bundled `compose.yaml`**: use the service name,
+  `http://whatsapp-mcp:8080` — n8n and whatsapp-mcp share a Docker network
+  and resolve each other by service name. `localhost` from inside the n8n
+  container would point at n8n itself, not this server.
+- **n8n running elsewhere** (host machine, different compose project, cloud):
+  use whatever address actually reaches this server — `localhost:8080` if
+  n8n runs on the same host outside Docker, or your real domain if it's
+  behind a reverse proxy.
 
 ### Option A — plain REST call (deterministic workflow step)
 
@@ -123,16 +208,24 @@ Other REST routes, same auth:
 
 If an n8n **AI Agent** node should decide dynamically whether/what to send,
 add an **MCP Client Tool** node as one of the agent's tools (no server change
-needed — n8n speaks MCP/SSE natively):
+needed — this server speaks both transports n8n supports):
 
-- Server Transport: `SSE`
-- SSE URL: `http://<host>:8080/sse`
+- Server Transport: **HTTP Streamable** (n8n now marks SSE deprecated —
+  use this)
+- HTTP Streamable URL: `http://<host>:8080/mcp`
 - Authentication: Bearer token = your `MCP_AUTH_TOKEN`, if set
 - Tools: select `send_message` (and any others you want the agent to use,
   e.g. `list_chats` / `search_contacts` so it can resolve a recipient itself)
 
 The agent can then call `send_message` with `to` and `message` arguments as
 part of its reasoning, same as any other tool.
+
+If you hit connection issues on n8n's Streamable HTTP option, it's worth
+checking your n8n version — several released versions have had bugs where
+the transport dropdown doesn't reliably take effect and it falls back to
+SSE at runtime. In that case, either update n8n or point the node at
+`http://<host>:8080/sse` with Server Transport set to `SSE` instead; this
+server keeps both endpoints live.
 
 ## Project layout
 

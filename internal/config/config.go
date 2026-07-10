@@ -26,6 +26,18 @@ type Config struct {
 	AuthToken string
 	// HistorySyncMaxAge, in days, bounds how much WhatsApp history backfill we keep.
 	HistorySyncMaxAgeDays int
+
+	// WebhookURL, if set, is POSTed a JSON payload for every incoming message
+	// (see internal/webhook). Empty disables webhook dispatch entirely.
+	WebhookURL string
+	// WebhookFromNumbers restricts dispatch to messages sent by these numbers
+	// (digits only, e.g. "6281234567890"), matched against the sender's JID
+	// user part. Empty means "notify for every incoming message".
+	WebhookFromNumbers []string
+	// WebhookSecret, if set, is used to sign the payload with HMAC-SHA256 in
+	// the X-Webhook-Signature header, so the receiver (e.g. an n8n Webhook
+	// node) can verify the request actually came from this server.
+	WebhookSecret string
 }
 
 // Load reads runtime config from the process environment. If a .env file is
@@ -44,6 +56,9 @@ func Load() Config {
 		LogLevel:              getEnv("LOG_LEVEL", "INFO"),
 		AuthToken:             getEnv("MCP_AUTH_TOKEN", ""),
 		HistorySyncMaxAgeDays: getEnvInt("HISTORY_SYNC_MAX_AGE_DAYS", 90),
+		WebhookURL:            getEnv("WEBHOOK_URL", ""),
+		WebhookFromNumbers:    getEnvList("WEBHOOK_FROM_NUMBERS"),
+		WebhookSecret:         getEnv("WEBHOOK_SECRET", ""),
 	}
 }
 
@@ -61,6 +76,24 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// getEnvList splits a comma-separated env var into trimmed, non-empty parts.
+// Returns nil (not an error) if the var is unset or empty.
+func getEnvList(key string) []string {
+	raw := getEnv(key, "")
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // loadDotEnv parses a simple KEY=VALUE .env file and calls os.Setenv for any

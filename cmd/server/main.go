@@ -20,6 +20,7 @@ import (
 	"github.com/flix/whatsapp-mcp/internal/mcpserver"
 	"github.com/flix/whatsapp-mcp/internal/restapi"
 	"github.com/flix/whatsapp-mcp/internal/store"
+	"github.com/flix/whatsapp-mcp/internal/webhook"
 	"github.com/flix/whatsapp-mcp/internal/whatsapp"
 )
 
@@ -45,20 +46,37 @@ func main() {
 	// doesn't require terminal access.
 	qrHandler := newQRHandler()
 
+	webhookDispatcher := webhook.New(cfg.WebhookURL, cfg.WebhookFromNumbers, cfg.WebhookSecret)
+	if cfg.WebhookURL != "" {
+		if len(cfg.WebhookFromNumbers) > 0 {
+			log.Printf("webhook: dispatching incoming messages from %v to %s", cfg.WebhookFromNumbers, cfg.WebhookURL)
+		} else {
+			log.Printf("webhook: dispatching all incoming messages to %s", cfg.WebhookURL)
+		}
+	}
+
 	waClient, err := whatsapp.New(ctx, cfg.WhatsAppDBPath, history, cfg.LogLevel, func(code string) {
 		log.Printf("Scan this QR code with WhatsApp (Linked Devices) to pair. It also renders at %s/qr", cfg.PublicBaseURL)
 		printQRToTerminal(code)
 		qrHandler.set(code)
-	})
+	}, webhookDispatcher.Dispatch)
 	if err != nil {
 		log.Fatalf("start whatsapp client: %v", err)
 	}
 	defer waClient.Close()
 
 	mcpSrv := mcpserver.Build(mcpserver.Deps{WA: waClient, History: history})
+
+	// Two transports, same MCP server: SSE is kept for older/other clients,
+	// but Streamable HTTP is what current n8n (and most other MCP clients)
+	// expect now -- n8n's MCP Client node marks SSE deprecated in favor of it.
 	sseSrv := server.NewSSEServer(mcpSrv,
 		server.WithBaseURL(cfg.PublicBaseURL),
 		server.WithKeepAlive(true),
+	)
+	streamableSrv := server.NewStreamableHTTPServer(mcpSrv,
+		server.WithEndpointPath("/mcp"),
+		server.WithHeartbeatInterval(15*time.Second),
 	)
 
 	mux := http.NewServeMux()
@@ -68,6 +86,7 @@ func main() {
 	})
 	mux.HandleFunc("/qr", qrHandler.serveHTTP(waClient))
 	mux.Handle("/api/", mcpserver.AuthMiddleware(cfg.AuthToken, restapi.Handler(restapi.Deps{WA: waClient, History: history})))
+	mux.Handle("/mcp", mcpserver.AuthMiddleware(cfg.AuthToken, streamableSrv))
 	mux.Handle("/", mcpserver.AuthMiddleware(cfg.AuthToken, sseSrv))
 
 	httpSrv := &http.Server{
@@ -77,7 +96,8 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("whatsapp-mcp listening on %s (MCP/SSE: %s/sse, REST: %s/api/v1)", cfg.HTTPAddr, cfg.PublicBaseURL, cfg.PublicBaseURL)
+		log.Printf("whatsapp-mcp listening on %s (MCP Streamable HTTP: %s/mcp, MCP SSE: %s/sse, REST: %s/api/v1)",
+			cfg.HTTPAddr, cfg.PublicBaseURL, cfg.PublicBaseURL, cfg.PublicBaseURL)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http server: %v", err)
 		}
@@ -89,6 +109,7 @@ func main() {
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
 	_ = sseSrv.Shutdown(shutdownCtx)
+	_ = streamableSrv.Shutdown(shutdownCtx)
 }
 
 func printQRToTerminal(code string) {
